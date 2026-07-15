@@ -1009,6 +1009,7 @@ function App(){
     {/* header */}
     <header style={{display:"flex",alignItems:"center",gap:14,padding:"10px 16px",
       borderBottom:`1px solid ${C.line}`,background:C.panel,flexWrap:"wrap"}}>
+      <img src="/dessina-logo.png" alt="Dessina" style={{height:32,marginRight:8}}/>
       <div style={{display:"flex",alignItems:"baseline",gap:10}}>
         <span style={{fontWeight:800,letterSpacing:"0.04em",fontSize:15}}>CUBOID INSERTION CHECKER</span>
         <span style={{...S.mono,fontSize:10,color:C.faint,border:`1px solid ${C.line}`,padding:"2px 6px",borderRadius:3}}>mm · 6-DOF path solver</span>
