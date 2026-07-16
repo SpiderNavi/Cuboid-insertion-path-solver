@@ -341,7 +341,7 @@ function densifyPath(path,half,stepMm){
   return out;
 }
 
-async function solveInsertion(cfg,settings,onProgress){
+async function solveInsertion(cfg,settings,onProgress,isExtraction=false){
   const t0=performance.now();
   const counter={n:0};
   const {box,opening,obj}=cfg;
@@ -357,7 +357,116 @@ async function solveInsertion(cfg,settings,onProgress){
   const stepMm=settings.stepMm;
   const timeUp=()=>performance.now()-t0>settings.maxTimeMs;
 
-  // find collision-free goal poses
+  if(isExtraction){
+    // Extraction: reverse the problem
+    // Start: object inside at final position (gPos, random/custom quat)
+    // Goal: object outside (reversed start position)
+    const startQuats=cfg.obj.anyOrientation?AA_QUATS:[Q_ID];
+    const startPoses=startQuats.map(q=>({p:gPos,q})).filter(pose=>poseFree(pose,half,panels,counter));
+    if(startPoses.length===0){
+      return {status:"no_goal",path:null,messages:["No collision-free start pose exists at the specified interior position."],
+        stats:{timeMs:performance.now()-t0,evaluated:counter.n,stage:"goal check"}};
+    }
+    const outsidePos=[0,0,0];
+    outsidePos[f.axis]=f.sign*(dims[f.axis]/2+box.wall+outDepth);
+    const goals=gQuats.map(q=>({p:outsidePos,q})).filter(pose=>poseFree(pose,half,panels,counter));
+    if(goals.length===0){
+      return {status:"no_goal",path:null,messages:["No collision-free external pose exists."],
+        stats:{timeMs:performance.now()-t0,evaluated:counter.n,stage:"goal check"}};
+    }
+    messages.push("EXTRACTION MODE: pulling object out from inside the enclosure.");
+    const finish=(rawPath,stage)=>{
+      const path=densifyPath(rawPath,half,Math.min(stepMm,3));
+      let tight={minAll:Infinity,minOpen:Infinity,minWall:Infinity,idx:0};
+      path.forEach((pose,i)=>{
+        const g=poseGapInfo(pose,half,panels,counter);
+        if(g.minAll<tight.minAll)tight={...g,idx:i};
+        tight.minOpen=Math.min(tight.minOpen,g.minOpen);
+        tight.minWall=Math.min(tight.minWall,g.minWall);
+      });
+      return {status:"feasible",path,messages,
+        stats:{timeMs:performance.now()-t0,evaluated:counter.n,stage,
+          minClearance:tight.minAll,minOpening:tight.minOpen,minWall:tight.minWall,
+          tightIdx:tight.idx,tightPose:path[tight.idx],finalPose:path[path.length-1]}};
+    };
+    // Try direct extraction (reverse)
+    for(const start of startPoses){
+      for(const goal of goals){
+        if(timeUp())break;
+        if(edgeFree(start,goal,half,panels,stepMm,rotR,counter)){
+          messages.push("Direct extraction path found (no rotation needed).");
+          return finish([start,goal],"direct");
+        }
+      }
+    }
+    messages.push("Direct extraction failed, running RRT-Connect...");
+    // RRT-Connect for extraction (same as insertion, just reversed start/goal)
+    const rng=mulberry32(1337);
+    const lo=[-dims[0]/2,-dims[1]/2,-dims[2]/2], hi=[dims[0]/2,dims[1]/2,dims[2]/2];
+    if(f.sign>0)hi[f.axis]=dims[f.axis]/2+box.wall+outDepth; else lo[f.axis]=-dims[f.axis]/2-box.wall-outDepth;
+    const samplePose=()=>{
+      const p=[lo[0]+rng()*(hi[0]-lo[0]),lo[1]+rng()*(hi[1]-lo[1]),lo[2]+rng()*(hi[2]-lo[2])];
+      const r=rng();
+      let q;
+      if(r<0.3)q=AA_QUATS[(rng()*AA_QUATS.length)|0];
+      else if(r<0.5)q=qMul(qAxisAngle([rng()*2-1,rng()*2-1,rng()*2-1],(rng()*0.8-0.4)),AA_QUATS[(rng()*AA_QUATS.length)|0]);
+      else q=qRandom(rng);
+      return{p,q};
+    };
+    const dist=(a,b)=>vLen(vSub(a.p,b.p))+qAngle(a.q,b.q)*rotR;
+    const step=settings.rrtStep;
+    const mkTree=(root)=>({nodes:[{pose:root,parent:-1}]});
+    const nearest=(tree,pose)=>{let bi=0,bd=Infinity;for(let i=0;i<tree.nodes.length;i++){const d=dist(tree.nodes[i].pose,pose);if(d<bd){bd=d;bi=i;}}return bi;};
+    const steer=(from,to)=>{const d=dist(from,to);if(d<=step)return to;const t=step/d;return{p:vLerp(from.p,to.p,t),q:qSlerp(from.q,to.q,t)};};
+    const extend=(tree,target)=>{
+      const ni=nearest(tree,target);
+      const nn=tree.nodes[ni].pose;
+      const np=steer(nn,target);
+      if(!poseFree(np,half,panels,counter))return{res:"trapped"};
+      if(!edgeFree(nn,np,half,panels,stepMm,rotR,counter))return{res:"trapped"};
+      tree.nodes.push({pose:np,parent:ni});
+      return{res:dist(np,target)<1e-6?"reached":"advanced",idx:tree.nodes.length-1};
+    };
+    const connect=(tree,target)=>{
+      let r;
+      do{r=extend(tree,target);}while(r.res==="advanced"&&!timeUp());
+      return r;
+    };
+    const trace=(tree,idx)=>{const out=[];let i=idx;while(i!==-1){out.push(tree.nodes[i].pose);i=tree.nodes[i].parent;}return out;};
+    let treeA=mkTree(startPoses[0]), treeB=mkTree(goals[0]);
+    for(let gi=1;gi<Math.min(goals.length,4);gi++)treeB.nodes.push({pose:goals[gi],parent:-1});
+    let iter=0;
+    while(!timeUp()&&treeA.nodes.length+treeB.nodes.length<settings.maxNodes){
+      iter++;
+      if(iter%150===0){onProgress&&onProgress("RRT-Connect… nodes "+(treeA.nodes.length+treeB.nodes.length));await sleep(0);}
+      const rand=samplePose();
+      const rA=extend(treeA,rand);
+      if(rA.res!=="trapped"){
+        const newPose=treeA.nodes[rA.idx].pose;
+        const rB=connect(treeB,newPose);
+        if(rB.res==="reached"){
+          const pathA=trace(treeA,rA.idx).reverse();
+          const pathB=trace(treeB,rB.idx);
+          let raw=pathA.concat(pathB);
+          for(let s2=0;s2<120&&raw.length>2&&!timeUp();s2++){
+            const i=1+((rng()*(raw.length-2))|0);
+            const j=1+((rng()*(raw.length-2))|0);
+            const a2=Math.min(i,j),b2=Math.max(i,j);
+            if(b2-a2<2)continue;
+            if(edgeFree(raw[a2],raw[b2],half,panels,stepMm,rotR,counter))
+              raw=raw.slice(0,a2+1).concat(raw.slice(b2));
+          }
+          messages.push("Extraction path found via RRT-Connect.");
+          return finish(raw,"rrt-connect");
+        }
+      }
+      const tmp=treeA;treeA=treeB;treeB=tmp;
+    }
+    return {status:"inconclusive",path:null,messages,
+      stats:{timeMs:performance.now()-t0,evaluated:counter.n,stage:"rrt-connect",nodes:treeA.nodes.length+treeB.nodes.length}};
+  }
+
+  // INSERTION MODE (original code)
   const goals=[];
   for(const q of gQuats){
     const pose={p:gPos,q};
@@ -596,7 +705,7 @@ function makeTextSprite(text,color){
   return sp;
 }
 
-function Viewport({cfg,result,tParam,showLabels,wireframe,sectionCut,onResetRef}){
+function Viewport({cfg,result,tParam,mode,showLabels,wireframe,sectionCut,onResetRef}){
   const mountRef=useRef(null);
   const stateRef=useRef(null);
 
@@ -771,16 +880,20 @@ function Viewport({cfg,result,tParam,showLabels,wireframe,sectionCut,onResetRef}
         gt.position.set(...tp.p);gt.quaternion.set(...tp.q);dyn.add(gt);
       }
     }else{
-      // idle: show object outside the opening face
+      // idle: show object outside the opening face (insertion) or inside center (extraction)
       const idleCfg=FACES[cfg.box.face]?cfg:{...cfg,box:{...cfg.box,face:"front"}};
-      pose=startPose(idleCfg,Q_ID,Math.max(obj.l,obj.w,obj.h)/2+(Number.isFinite(cfg.box.wall)?cfg.box.wall:5)+20);
+      if(mode==="extraction"){
+        pose={p:[0,0,0],q:Q_ID};  // center of box for extraction
+      }else{
+        pose=startPose(idleCfg,Q_ID,Math.max(obj.l,obj.w,obj.h)/2+(Number.isFinite(cfg.box.wall)?cfg.box.wall:5)+20);
+      }
     }
     if(pose&&pose.p&&pose.p.every(Number.isFinite)){
       mesh.position.set(...pose.p);
       mesh.quaternion.set(pose.q[0],pose.q[1],pose.q[2],pose.q[3]);
     }
     }catch(err){console.error("Viewport pose update error:",err);}
-  },[JSON.stringify(cfg),result,tParam]);
+  },[JSON.stringify(cfg),result,tParam,mode]);
 
   return <div ref={mountRef} style={{position:"absolute",inset:0}}/>;
 }
@@ -900,6 +1013,14 @@ function App(){
   const[sectionCut,setSectionCut]=useState(false);
   const[showTests,setShowTests]=useState(false);
   const[copied,setCopied]=useState(false);
+  const[leftSidebarOpen,setLeftSidebarOpen]=useState(true);
+  const[rightSidebarOpen,setRightSidebarOpen]=useState(true);
+  const[mode,setMode]=useState("insertion");  // "insertion" or "extraction"
+  const[customStartPos,setCustomStartPos]=useState(false);
+  const[startX,setStartX]=useState(0);
+  const[startY,setStartY]=useState(0);
+  const[startZ,setStartZ]=useState(0);
+  const[startRot,setStartRot]=useState("identity");  // "identity", "random", or custom quat
   const resetCamRef=useRef(null);
   const fileRef=useRef(null);
 
@@ -933,7 +1054,7 @@ function App(){
       setRunning(false);setProgress("");return;
     }
     try{
-      const res=await solveInsertion(cfg,settings,setProgress);
+      const res=await solveInsertion(cfg,settings,setProgress,mode==="extraction");
       setResult(res);
       if(res.status==="feasible"&&res.path&&res.path.length){setT(0);setPlaying(true);}
     }catch(err){
@@ -1015,6 +1136,22 @@ function App(){
         <span style={{...S.mono,fontSize:10,color:C.faint,border:`1px solid ${C.line}`,padding:"2px 6px",borderRadius:3}}>mm · 6-DOF path solver</span>
       </div>
       <div style={{flex:1}}/>
+      <div style={{display:"flex",alignItems:"center",gap:8,padding:"6px 12px",border:`1px solid ${C.line}`,borderRadius:6,background:C.panel2}}>
+        <span style={{fontSize:11,fontWeight:600,color:mode==="insertion"?C.accent:C.dim,letterSpacing:"0.06em"}}>INSERT</span>
+        <button onClick={()=>setMode(mode==="insertion"?"extraction":"insertion")}
+          style={{width:50,height:26,borderRadius:13,border:"none",background:mode==="insertion"?C.good:C.bad,
+            cursor:"pointer",position:"relative",transition:"all 0.3s",display:"flex",alignItems:"center",
+            padding:"2px 2px"}}>
+          <div style={{width:22,height:22,borderRadius:11,background:"white",transition:"transform 0.3s",
+            transform:mode==="extraction"?"translateX(24px)":"translateX(0)",boxShadow:"0 2px 4px rgba(0,0,0,0.2)"}}/>
+        </button>
+        <span style={{fontSize:11,fontWeight:600,color:mode==="extraction"?C.accent:C.dim,letterSpacing:"0.06em"}}>EXTRACT</span>
+      </div>
+      <button onClick={run} disabled={running||errors.length>0}
+        style={{padding:"8px 16px",borderRadius:6,border:"none",cursor:running?"wait":"pointer",
+          background:running?C.line:C.accent,color:"#08131a",fontWeight:800,letterSpacing:"0.06em",fontSize:12}}>
+        {running?"SOLVING…":"RUN"}
+      </button>
       <select value={-1} onChange={e=>{const i=+e.target.value;if(i>=0){setCfg(JSON.parse(JSON.stringify(PRESETS[i].cfg)));setResult(null);setT(0);}}}
         style={{background:C.bg,color:C.ink,border:`1px solid ${C.line}`,borderRadius:4,padding:"6px 8px",fontSize:12}}>
         <option value={-1}>Load example preset…</option>
@@ -1027,9 +1164,9 @@ function App(){
     </header>
 
     {/* main grid */}
-    <div style={{flex:1,display:"grid",gridTemplateColumns:"288px 1fr 316px",minHeight:0}}>
+    <div style={{flex:1,display:"grid",gridTemplateColumns:leftSidebarOpen&&rightSidebarOpen?"288px 1fr 316px":leftSidebarOpen?"288px 1fr":rightSidebarOpen?"1fr 316px":"1fr",minHeight:0}}>
       {/* left: inputs */}
-      <aside style={{overflowY:"auto",borderRight:`1px solid ${C.line}`,background:C.panel,padding:"4px 14px 20px"}}>
+      {leftSidebarOpen&&<aside style={{overflowY:"auto",borderRight:`1px solid ${C.line}`,background:C.panel,padding:"4px 14px 20px"}}>
         <Section title="Enclosure (internal)">
           <Num label="Width X" value={cfg.box.x} onChange={v=>upd("box","x",v)}/>
           <Num label="Height Y" value={cfg.box.y} onChange={v=>upd("box","y",v)}/>
@@ -1102,11 +1239,11 @@ function App(){
         {showTests&&<div style={{marginTop:8,fontSize:11.5,...S.mono}}>
           {tests.map((t,i)=><div key={i} style={{color:t.ok?C.good:C.bad,padding:"2px 0"}}>{t.ok?"✓":"✗"} {t.name}</div>)}
         </div>}
-      </aside>
+      </aside>}
 
       {/* centre: viewport */}
       <main style={{position:"relative",minWidth:0,background:C.bg}}>
-        <Viewport cfg={cfg} result={result} tParam={tParam}
+        <Viewport cfg={cfg} result={result} tParam={tParam} mode={mode}
           showLabels={showLabels} wireframe={wireframe} sectionCut={sectionCut} onResetRef={resetCamRef}/>
         {/* status lamp */}
         <div style={{position:"absolute",top:12,left:12,right:12,display:"flex",gap:10,alignItems:"center",
@@ -1118,11 +1255,18 @@ function App(){
             <div style={{color:C.dim,fontSize:11.5}}>{statusInfo.sub}</div>
           </div>
         </div>
-        {/* view toggles */}
+        {/* view toggles + sidebar toggles */}
         <div style={{position:"absolute",top:70,right:12,display:"flex",flexDirection:"column",gap:6}}>
           {[["Labels",showLabels,setShowLabels],["Wireframe",wireframe,setWireframe],["Section cut",sectionCut,setSectionCut]].map(([n,v,set])=>(
             <button key={n} onClick={()=>set(x=>!x)} style={{...btn(v),fontSize:11}}>{n}</button>))}
           <button onClick={()=>resetCamRef.current&&resetCamRef.current()} style={{...btn(),fontSize:11}}>Reset camera</button>
+          <div style={{height:1,background:C.line,margin:"4px 0"}}/>
+          <button onClick={()=>setLeftSidebarOpen(x=>!x)} style={{...btn(!leftSidebarOpen),fontSize:11}}>
+            {leftSidebarOpen?"Hide inputs":"Show inputs"}
+          </button>
+          <button onClick={()=>setRightSidebarOpen(x=>!x)} style={{...btn(!rightSidebarOpen),fontSize:11}}>
+            {rightSidebarOpen?"Hide output":"Show output"}
+          </button>
         </div>
         {/* timeline */}
         {result&&result.path&&<div style={{position:"absolute",left:12,right:12,bottom:12,display:"flex",gap:10,alignItems:"center",
@@ -1137,7 +1281,7 @@ function App(){
       </main>
 
       {/* right: results */}
-      <aside style={{overflowY:"auto",borderLeft:`1px solid ${C.line}`,background:C.panel,padding:"12px 14px 20px"}}>
+      {rightSidebarOpen&&<aside style={{overflowY:"auto",borderLeft:`1px solid ${C.line}`,background:C.panel,padding:"12px 14px 20px"}}>
         <div style={{...S.label,marginBottom:8}}>Result</div>
         <div style={{border:`1px solid ${statusInfo.tone}55`,background:`${statusInfo.tone}10`,borderRadius:8,padding:"12px 12px"}}>
           <div style={{fontWeight:800,color:statusInfo.tone,letterSpacing:"0.06em",fontSize:13}}>{statusInfo.head}</div>
@@ -1178,7 +1322,7 @@ function App(){
           insertion is impossible or that the solver needs more search time or finer sampling. Validate critical
           production cases using CAD interference checks or physical testing.
         </div>
-      </aside>
+      </aside>}
     </div>
 
     {/* bottom: step-by-step checks */}
