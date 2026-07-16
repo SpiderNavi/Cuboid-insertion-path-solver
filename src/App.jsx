@@ -181,8 +181,19 @@ function obbPanelGap(ca,ha,axes,cb,hb){
 }
 
 /* ----------------------------- pose checks ----------------------------- */
-function poseGapInfo(pose,half,panels,counter){
+function poseGapInfo(pose,half,panels,counter,openingShape,opening,face,collisionMethod){
   if(counter)counter.n++;
+  if(openingShape==="circle"){
+    const circleGap=collisionMethod==="precise"?circleOpeningGapPrecise(pose,half,opening,face):circleOpeningGapFast(pose,half,opening,face);
+    const axes=qToAxes(pose.q);
+    let minWall=Infinity;
+    for(const p of panels){
+      if(p.isOpeningWall)continue;
+      const g=obbPanelGap(pose.p,half,axes,p.center,p.half);
+      minWall=Math.min(minWall,g);
+    }
+    return {collide:circleGap<=0,minAll:circleGap,minOpen:circleGap,minWall};
+  }
   const axes=qToAxes(pose.q);
   let minAll=Infinity,minOpen=Infinity,minWall=Infinity,collide=false;
   for(const p of panels){
@@ -193,21 +204,31 @@ function poseGapInfo(pose,half,panels,counter){
   }
   return {collide,minAll,minOpen,minWall};
 }
-function poseFree(pose,half,panels,counter){
+function poseFree(pose,half,panels,counter,openingShape,opening,face,collisionMethod){
   if(counter)counter.n++;
+  if(openingShape==="circle"){
+    const circleGap=collisionMethod==="precise"?circleOpeningGapPrecise(pose,half,opening,face):circleOpeningGapFast(pose,half,opening,face);
+    if(circleGap<=0)return false;
+    const axes=qToAxes(pose.q);
+    for(const p of panels){
+      if(p.isOpeningWall)continue;
+      if(obbPanelGap(pose.p,half,axes,p.center,p.half)<=0)return false;
+    }
+    return true;
+  }
   const axes=qToAxes(pose.q);
   for(const p of panels){
     if(obbPanelGap(pose.p,half,axes,p.center,p.half)<=0)return false;
   }
   return true;
 }
-function edgeFree(a,b,half,panels,stepMm,rotRadius,counter){
+function edgeFree(a,b,half,panels,stepMm,rotRadius,counter,openingShape,opening,face,collisionMethod){
   const dist=vLen(vSub(b.p,a.p))+qAngle(a.q,b.q)*rotRadius;
   const n=Math.max(2,Math.ceil(dist/stepMm)+1);
   for(let i=0;i<=n;i++){
     const t=i/n;
     const pose={p:vLerp(a.p,b.p,t),q:qSlerp(a.q,b.q,t)};
-    if(!poseFree(pose,half,panels,counter))return false;
+    if(!poseFree(pose,half,panels,counter,openingShape,opening,face,collisionMethod))return false;
   }
   return true;
 }
@@ -341,7 +362,7 @@ function densifyPath(path,half,stepMm){
   return out;
 }
 
-async function solveInsertion(cfg,settings,onProgress,isExtraction=false){
+async function solveInsertion(cfg,settings,onProgress,isExtraction=false,openingShape="rectangle",collisionMethod="fast"){
   const t0=performance.now();
   const counter={n:0};
   const {box,opening,obj}=cfg;
@@ -362,14 +383,14 @@ async function solveInsertion(cfg,settings,onProgress,isExtraction=false){
     // Start: object inside at final position (gPos, random/custom quat)
     // Goal: object outside (reversed start position)
     const startQuats=cfg.obj.anyOrientation?AA_QUATS:[Q_ID];
-    const startPoses=startQuats.map(q=>({p:gPos,q})).filter(pose=>poseFree(pose,half,panels,counter));
+    const startPoses=startQuats.map(q=>({p:gPos,q})).filter(pose=>poseFree(pose,half,panels,counter,openingShape,cfg.opening,cfg.box.face,collisionMethod));
     if(startPoses.length===0){
       return {status:"no_goal",path:null,messages:["No collision-free start pose exists at the specified interior position."],
         stats:{timeMs:performance.now()-t0,evaluated:counter.n,stage:"goal check"}};
     }
     const outsidePos=[0,0,0];
     outsidePos[f.axis]=f.sign*(dims[f.axis]/2+box.wall+outDepth);
-    const goals=gQuats.map(q=>({p:outsidePos,q})).filter(pose=>poseFree(pose,half,panels,counter));
+    const goals=gQuats.map(q=>({p:outsidePos,q})).filter(pose=>poseFree(pose,half,panels,counter,openingShape,cfg.opening,cfg.box.face,collisionMethod));
     if(goals.length===0){
       return {status:"no_goal",path:null,messages:["No collision-free external pose exists."],
         stats:{timeMs:performance.now()-t0,evaluated:counter.n,stage:"goal check"}};
@@ -379,7 +400,7 @@ async function solveInsertion(cfg,settings,onProgress,isExtraction=false){
       const path=densifyPath(rawPath,half,Math.min(stepMm,3));
       let tight={minAll:Infinity,minOpen:Infinity,minWall:Infinity,idx:0};
       path.forEach((pose,i)=>{
-        const g=poseGapInfo(pose,half,panels,counter);
+        const g=poseGapInfo(pose,half,panels,counter,openingShape,cfg.opening,cfg.box.face,collisionMethod);
         if(g.minAll<tight.minAll)tight={...g,idx:i};
         tight.minOpen=Math.min(tight.minOpen,g.minOpen);
         tight.minWall=Math.min(tight.minWall,g.minWall);
@@ -393,7 +414,7 @@ async function solveInsertion(cfg,settings,onProgress,isExtraction=false){
     for(const start of startPoses){
       for(const goal of goals){
         if(timeUp())break;
-        if(edgeFree(start,goal,half,panels,stepMm,rotR,counter)){
+        if(edgeFree(start,goal,half,panels,stepMm,rotR,counter,openingShape,cfg.opening,cfg.box.face,collisionMethod)){
           messages.push("Direct extraction path found (no rotation needed).");
           return finish([start,goal],"direct");
         }
@@ -423,7 +444,7 @@ async function solveInsertion(cfg,settings,onProgress,isExtraction=false){
       const nn=tree.nodes[ni].pose;
       const np=steer(nn,target);
       if(!poseFree(np,half,panels,counter))return{res:"trapped"};
-      if(!edgeFree(nn,np,half,panels,stepMm,rotR,counter))return{res:"trapped"};
+      if(!edgeFree(nn,np,half,panels,stepMm,rotR,counter,openingShape,cfg.opening,cfg.box.face,collisionMethod))return{res:"trapped"};
       tree.nodes.push({pose:np,parent:ni});
       return{res:dist(np,target)<1e-6?"reached":"advanced",idx:tree.nodes.length-1};
     };
@@ -453,7 +474,7 @@ async function solveInsertion(cfg,settings,onProgress,isExtraction=false){
             const j=1+((rng()*(raw.length-2))|0);
             const a2=Math.min(i,j),b2=Math.max(i,j);
             if(b2-a2<2)continue;
-            if(edgeFree(raw[a2],raw[b2],half,panels,stepMm,rotR,counter))
+            if(edgeFree(raw[a2],raw[b2],half,panels,stepMm,rotR,counter,openingShape,cfg.opening,cfg.box.face,collisionMethod))
               raw=raw.slice(0,a2+1).concat(raw.slice(b2));
           }
           messages.push("Extraction path found via RRT-Connect.");
@@ -470,7 +491,7 @@ async function solveInsertion(cfg,settings,onProgress,isExtraction=false){
   const goals=[];
   for(const q of gQuats){
     const pose={p:gPos,q};
-    if(poseFree(pose,half,panels,counter))goals.push(pose);
+    if(poseFree(pose,half,panels,counter,openingShape,cfg.opening,cfg.box.face,collisionMethod))goals.push(pose);
   }
   if(goals.length===0){
     return {status:"no_goal",path:null,messages:["No collision-free final pose exists at the requested final position/orientation (including tolerance)."],
@@ -481,7 +502,7 @@ async function solveInsertion(cfg,settings,onProgress,isExtraction=false){
     const path=densifyPath(rawPath,half,Math.min(stepMm,3));
     let tight={minAll:Infinity,minOpen:Infinity,minWall:Infinity,idx:0};
     path.forEach((pose,i)=>{
-      const g=poseGapInfo(pose,half,panels,counter);
+      const g=poseGapInfo(pose,half,panels,counter,openingShape,cfg.opening,cfg.box.face,collisionMethod);
       if(g.minAll<tight.minAll)tight={...g,idx:i};
       tight.minOpen=Math.min(tight.minOpen,g.minOpen);
       tight.minWall=Math.min(tight.minWall,g.minWall);
@@ -506,12 +527,12 @@ async function solveInsertion(cfg,settings,onProgress,isExtraction=false){
       const depthHalf=half[0]*Math.abs(axes[0][f.axis])+half[1]*Math.abs(axes[1][f.axis])+half[2]*Math.abs(axes[2][f.axis]);
       inside.p[f.axis]=f.sign*(dims[f.axis]/2-depthHalf-0.5);
       if(!poseFree(inside,half,panels,counter))continue;
-      if(!edgeFree(s,inside,half,panels,stepMm,rotR,counter))continue;
+      if(!edgeFree(s,inside,half,panels,stepMm,rotR,counter,openingShape,cfg.opening,cfg.box.face,collisionMethod))continue;
       if(qAngle(q,goal.q)<1e-6){
-        if(edgeFree(inside,goal,half,panels,stepMm,rotR,counter))
+        if(edgeFree(inside,goal,half,panels,stepMm,rotR,counter,openingShape,cfg.opening,cfg.box.face,collisionMethod))
           {messages.push("Direct axis-aligned insertion succeeded (no rotation needed).");return finish([s,inside,goal],"direct");}
       }else{
-        if(edgeFree(inside,goal,half,panels,stepMm,rotR,counter))
+        if(edgeFree(inside,goal,half,panels,stepMm,rotR,counter,openingShape,cfg.opening,cfg.box.face,collisionMethod))
           {messages.push("Axis-aligned pass-through, then reorientation inside the box.");return finish([s,inside,goal],"direct+rotate");}
       }
     }
@@ -534,7 +555,7 @@ async function solveInsertion(cfg,settings,onProgress,isExtraction=false){
           const s=startPose(cfg,qTilt,outDepth);
           if(!poseFree(s,half,panels,counter))continue;
           // simultaneous translate+rotate from tilted-outside to goal
-          if(edgeFree(s,goal,half,panels,stepMm,rotR,counter)){
+          if(edgeFree(s,goal,half,panels,stepMm,rotR,counter,openingShape,cfg.opening,cfg.box.face,collisionMethod)){
             messages.push("Tilted insertion found: rotate "+ (ang*180/Math.PI).toFixed(0)+"° about the "+(axis===uAxis?"horizontal":"vertical")+" face axis while translating through the opening.");
             return finish([s,goal],"tilt-sweep");
           }
@@ -544,8 +565,8 @@ async function solveInsertion(cfg,settings,onProgress,isExtraction=false){
           mid.p[f.axis]=f.sign*(dims[f.axis]/2-rotR-0.5);
           if(mid.p[f.axis]*f.sign<-dims[f.axis]/2)continue;
           if(poseFree(mid,half,panels,counter)
-            &&edgeFree(s,mid,half,panels,stepMm,rotR,counter)
-            &&edgeFree(mid,goal,half,panels,stepMm,rotR,counter)){
+            &&edgeFree(s,mid,half,panels,stepMm,rotR,counter,openingShape,cfg.opening,cfg.box.face,collisionMethod)
+            &&edgeFree(mid,goal,half,panels,stepMm,rotR,counter,openingShape,cfg.opening,cfg.box.face,collisionMethod)){
             messages.push("Tilted pass-through with intermediate pose, then reorientation to final pose.");
             return finish([s,mid,goal],"tilt-sweep");
           }
@@ -580,7 +601,7 @@ async function solveInsertion(cfg,settings,onProgress,isExtraction=false){
     const nn=tree.nodes[ni].pose;
     const np=steer(nn,target);
     if(!poseFree(np,half,panels,counter))return{res:"trapped"};
-    if(!edgeFree(nn,np,half,panels,stepMm,rotR,counter))return{res:"trapped"};
+    if(!edgeFree(nn,np,half,panels,stepMm,rotR,counter,openingShape,cfg.opening,cfg.box.face,collisionMethod))return{res:"trapped"};
     tree.nodes.push({pose:np,parent:ni});
     return{res:dist(np,target)<1e-6?"reached":"advanced",idx:tree.nodes.length-1};
   };
@@ -615,7 +636,7 @@ async function solveInsertion(cfg,settings,onProgress,isExtraction=false){
           const j=1+((rng()*(raw.length-2))|0);
           const a2=Math.min(i,j),b2=Math.max(i,j);
           if(b2-a2<2)continue;
-          if(edgeFree(raw[a2],raw[b2],half,panels,stepMm,rotR,counter))
+          if(edgeFree(raw[a2],raw[b2],half,panels,stepMm,rotR,counter,openingShape,cfg.opening,cfg.box.face,collisionMethod))
             raw=raw.slice(0,a2+1).concat(raw.slice(b2));
         }
         messages.push("RRT-Connect found a randomized collision-free path ("+iter+" iterations).");
@@ -627,6 +648,70 @@ async function solveInsertion(cfg,settings,onProgress,isExtraction=false){
   messages.push("Stage 3: RRT-Connect exhausted the search budget ("+iter+" iterations, "+(treeA.nodes.length+treeB.nodes.length)+" nodes).");
   return {status:"inconclusive",path:null,messages,
     stats:{timeMs:performance.now()-t0,evaluated:counter.n,stage:"rrt-connect",nodes:treeA.nodes.length+treeB.nodes.length}};
+}
+
+/* ----------------------- circle opening collision ----------------------- */
+/** Fast method: check if smallest bounding circle of cuboid's cross-section fits through circle opening */
+function circleOpeningGapFast(pose,half,opening,face){
+  const axes=qToAxes(pose.q);
+  const f=FACES[face];
+  // Project cuboid onto face plane (u,v coords)
+  const points=[];
+  for(let i=0;i<8;i++){
+    const c=[(i&1)?half[0]:-half[0],(i&2)?half[1]:-half[1],(i&4)?half[2]:-half[2]];
+    const w=[
+      axes[0][0]*c[0]+axes[1][0]*c[1]+axes[2][0]*c[2],
+      axes[0][1]*c[0]+axes[1][1]*c[1]+axes[2][1]*c[2],
+      axes[0][2]*c[0]+axes[1][2]*c[1]+axes[2][2]*c[2]
+    ];
+    points.push([w[f.u],w[f.v]]);
+  }
+  // Find bounding circle of projected points
+  let cx=0,cy=0;
+  for(const p of points){cx+=p[0];cy+=p[1];}
+  cx/=points.length;cy/=points.length;
+  let r=0;
+  for(const p of points)r=Math.max(r,Math.hypot(p[0]-cx,p[1]-cy));
+  // Check if it fits through the circle opening
+  const dx=(cx+pose.p[f.u])-opening.offU;
+  const dy=(cy+pose.p[f.v])-opening.offV;
+  const dist=Math.hypot(dx,dy);
+  return opening.w/2-dist-r;  // gap between circle and bounding circle
+}
+
+/** Precise method: polygon-in-circle collision (slow but exact) */
+function circleOpeningGapPrecise(pose,half,opening,face){
+  const axes=qToAxes(pose.q);
+  const f=FACES[face];
+  // Project 8 corners of cuboid onto face
+  const corners=[];
+  for(let i=0;i<8;i++){
+    const c=[(i&1)?half[0]:-half[0],(i&2)?half[1]:-half[1],(i&4)?half[2]:-half[2]];
+    const w=[
+      axes[0][0]*c[0]+axes[1][0]*c[1]+axes[2][0]*c[2]+pose.p[f.u],
+      axes[0][1]*c[0]+axes[1][1]*c[1]+axes[2][1]*c[2]+pose.p[f.v],
+    ];
+    corners.push(w);
+  }
+  // Check if any corner is outside the circle
+  const cx=opening.offU, cy=opening.offV, radius=opening.w/2;
+  let minGap=Infinity;
+  for(const [x,y] of corners){
+    const d=Math.hypot(x-cx,y-cy);
+    minGap=Math.min(minGap,radius-d);
+  }
+  // Also check edges (line-circle distance)
+  const edges=[[0,1],[1,3],[3,2],[2,0],[4,5],[5,7],[7,6],[6,4],[0,4],[1,5],[3,7],[2,6]];
+  for(const [i,j] of edges){
+    const [x1,y1]=corners[i], [x2,y2]=corners[j];
+    const dx=x2-x1,dy=y2-y1;
+    const len=Math.hypot(dx,dy)||1e-9;
+    const t=Math.max(0,Math.min(1,((cx-x1)*dx+(cy-y1)*dy)/(len*len)));
+    const px=x1+t*dx, py=y1+t*dy;
+    const d=Math.hypot(px-cx,py-cy);
+    minGap=Math.min(minGap,radius-d);
+  }
+  return minGap;
 }
 
 /* ----------------------- clearance classification ----------------------- */
@@ -705,7 +790,7 @@ function makeTextSprite(text,color){
   return sp;
 }
 
-function Viewport({cfg,result,tParam,mode,showLabels,wireframe,sectionCut,onResetRef}){
+function Viewport({cfg,result,tParam,mode,openingShape,showLabels,wireframe,sectionCut,onResetRef}){
   const mountRef=useRef(null);
   const stateRef=useRef(null);
 
@@ -807,17 +892,35 @@ function Viewport({cfg,result,tParam,mode,showLabels,wireframe,sectionCut,onRese
     enclosure.add(iw);
     // opening outline (actual opening, before clearance) in amber
     const shape=[];
-    const w2=opening.w/2,h2=opening.h/2;
-    const corners=[[-w2,-h2],[w2,-h2],[w2,h2],[-w2,h2],[-w2,-h2]];
-    const pts=corners.map(([a,b])=>{
-      const p=[0,0,0];
-      p[f.u]=opening.offU+a;p[f.v]=opening.offV+b;
-      p[f.axis]=f.sign*(dims[f.axis]/2+box.wall+0.6);
-      return new THREE.Vector3(...p);});
-    const og=new THREE.BufferGeometry().setFromPoints(pts);
-    enclosure.add(new THREE.Line(og,new THREE.LineBasicMaterial({color:new THREE.Color(C.amber),linewidth:2})));
-    const pts2=pts.map(p=>{const q=p.clone();q.setComponent(f.axis,f.sign*(dims[f.axis]/2-0.6));return q;});
-    enclosure.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts2),new THREE.LineBasicMaterial({color:new THREE.Color(C.amber),transparent:true,opacity:0.5})));
+    if(openingShape==="rectangle"){
+      const w2=opening.w/2,h2=opening.h/2;
+      const corners=[[-w2,-h2],[w2,-h2],[w2,h2],[-w2,h2],[-w2,-h2]];
+      const pts=corners.map(([a,b])=>{
+        const p=[0,0,0];
+        p[f.u]=opening.offU+a;p[f.v]=opening.offV+b;
+        p[f.axis]=f.sign*(dims[f.axis]/2+box.wall+0.6);
+        return new THREE.Vector3(...p);});
+      const og=new THREE.BufferGeometry().setFromPoints(pts);
+      enclosure.add(new THREE.Line(og,new THREE.LineBasicMaterial({color:new THREE.Color(C.amber),linewidth:2})));
+      const pts2=pts.map(p=>{const q=p.clone();q.setComponent(f.axis,f.sign*(dims[f.axis]/2-0.6));return q;});
+      enclosure.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts2),new THREE.LineBasicMaterial({color:new THREE.Color(C.amber),transparent:true,opacity:0.5})));
+    }else{
+      // Circle opening
+      const r=opening.w/2;
+      const pts=[];
+      for(let i=0;i<=64;i++){
+        const ang=i/64*Math.PI*2;
+        const p=[0,0,0];
+        p[f.u]=opening.offU+Math.cos(ang)*r;
+        p[f.v]=opening.offV+Math.sin(ang)*r;
+        p[f.axis]=f.sign*(dims[f.axis]/2+box.wall+0.6);
+        pts.push(new THREE.Vector3(...p));
+      }
+      const og=new THREE.BufferGeometry().setFromPoints(pts);
+      enclosure.add(new THREE.Line(og,new THREE.LineBasicMaterial({color:new THREE.Color(C.amber),linewidth:2})));
+      const pts2=pts.map(p=>{const q=p.clone();q.setComponent(f.axis,f.sign*(dims[f.axis]/2-0.6));return q;});
+      enclosure.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts2),new THREE.LineBasicMaterial({color:new THREE.Color(C.amber),transparent:true,opacity:0.5})));
+    }
     // labels
     if(showLabels){
       const lx=makeTextSprite(`X ${box.x} mm`,C.dim);lx.position.set(0,-box.y/2-30,box.z/2+40);enclosure.add(lx);
@@ -835,7 +938,7 @@ function Viewport({cfg,result,tParam,mode,showLabels,wireframe,sectionCut,onRese
     st.fitR=fit;
     if(!st.userMoved)st.sph.r=fit;
     }catch(err){console.error("Viewport geometry rebuild error:",err);}
-  },[JSON.stringify(cfg),showLabels,wireframe,sectionCut]);
+  },[JSON.stringify(cfg),showLabels,wireframe,sectionCut,openingShape]);
 
   // dynamic: object pose, path, ghosts, tight marker
   useEffect(()=>{
@@ -924,7 +1027,7 @@ const PRESETS=[
     obj:{l:120,w:80,h:60,clearance:0.5,finalMode:"center",fx:0,fy:0,fz:0,anyOrientation:true}}},
 ];
 
-const DEFAULT_SETTINGS={maxTimeMs:5000,stepMm:4,rrtStep:30,maxNodes:6000};
+const DEFAULT_SETTINGS={maxTimeMs:5000,stepMm:4,rrtStep:30,maxNodes:6000,collisionMethod:"fast"};  // "fast" or "precise"
 
 function eulerDeg(q){
   if(!q||q.length!==4)return[0,0,0];
@@ -1021,6 +1124,7 @@ function App(){
   const[startY,setStartY]=useState(0);
   const[startZ,setStartZ]=useState(0);
   const[startRot,setStartRot]=useState("identity");  // "identity", "random", or custom quat
+  const[openingShape,setOpeningShape]=useState("rectangle");  // "rectangle" or "circle"
   const resetCamRef=useRef(null);
   const fileRef=useRef(null);
 
@@ -1054,7 +1158,7 @@ function App(){
       setRunning(false);setProgress("");return;
     }
     try{
-      const res=await solveInsertion(cfg,settings,setProgress,mode==="extraction");
+      const res=await solveInsertion(cfg,settings,setProgress,mode==="extraction",openingShape,settings.collisionMethod||"fast");
       setResult(res);
       if(res.status==="feasible"&&res.path&&res.path.length){setT(0);setPlaying(true);}
     }catch(err){
@@ -1181,11 +1285,32 @@ function App(){
           </label>
         </Section>
         <Section title="Opening">
-          <Num label="Width" value={cfg.opening.w} onChange={v=>upd("opening","w",v)}/>
-          <Num label="Height" value={cfg.opening.h} onChange={v=>upd("opening","h",v)}/>
-          <Num label="Horiz. offset" value={cfg.opening.offU} onChange={v=>upd("opening","offU",v)}/>
-          <Num label="Vert. offset" value={cfg.opening.offV} onChange={v=>upd("opening","offV",v)}/>
-          <Num label="Corner radius" value={cfg.opening.radius} onChange={v=>upd("opening","radius",v)}/>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,padding:"6px 8px",border:`1px solid ${C.line}`,borderRadius:5,background:C.panel2}}>
+            <span style={{fontSize:11,fontWeight:600,color:openingShape==="rectangle"?C.accent:C.dim,letterSpacing:"0.06em"}}>RECT</span>
+            <button onClick={()=>setOpeningShape(openingShape==="rectangle"?"circle":"rectangle")}
+              style={{width:45,height:24,borderRadius:12,border:"none",background:openingShape==="rectangle"?C.good:C.bad,
+                cursor:"pointer",position:"relative",transition:"all 0.3s",display:"flex",alignItems:"center",
+                padding:"2px 2px"}}>
+              <div style={{width:20,height:20,borderRadius:10,background:"white",transition:"transform 0.3s",
+                transform:openingShape==="circle"?"translateX(21px)":"translateX(0)",boxShadow:"0 2px 4px rgba(0,0,0,0.2)"}}/>
+            </button>
+            <span style={{fontSize:11,fontWeight:600,color:openingShape==="circle"?C.accent:C.dim,letterSpacing:"0.06em"}}>CIRCLE</span>
+          </div>
+          {openingShape==="rectangle"?(
+            <>
+              <Num label="Width" value={cfg.opening.w} onChange={v=>upd("opening","w",v)}/>
+              <Num label="Height" value={cfg.opening.h} onChange={v=>upd("opening","h",v)}/>
+              <Num label="Horiz. offset" value={cfg.opening.offU} onChange={v=>upd("opening","offU",v)}/>
+              <Num label="Vert. offset" value={cfg.opening.offV} onChange={v=>upd("opening","offV",v)}/>
+              <Num label="Corner radius" value={cfg.opening.radius} onChange={v=>upd("opening","radius",v)}/>
+            </>
+          ):(
+            <>
+              <Num label="Radius" value={cfg.opening.w} onChange={v=>upd("opening","w",v)} suffix="mm"/>
+              <Num label="Center offset X" value={cfg.opening.offU} onChange={v=>upd("opening","offU",v)}/>
+              <Num label="Center offset Y" value={cfg.opening.offV} onChange={v=>upd("opening","offV",v)}/>
+            </>
+          )}
           <Num label="Clearance margin" value={cfg.opening.clearance} step={0.1} onChange={v=>upd("opening","clearance",v)}/>
         </Section>
         <Section title="Inserted object">
@@ -1224,6 +1349,14 @@ function App(){
             onChange={v=>setSettings(s=>({...s,rrtStep:Math.max(5,v)}))}/>
           <Num label="Max RRT nodes" value={settings.maxNodes} step={500} suffix="" min={500}
             onChange={v=>setSettings(s=>({...s,maxNodes:Math.max(500,v)}))}/>
+          <label style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"6px 0"}}>
+            <span style={S.label}>Circle collision</span>
+            <select value={settings.collisionMethod||"fast"} onChange={e=>setSettings(s=>({...s,collisionMethod:e.target.value}))}
+              style={{background:C.bg,color:C.ink,border:`1px solid ${C.line}`,borderRadius:4,padding:"5px 6px",fontSize:12}}>
+              <option value="fast">Fast (bounding circle)</option>
+              <option value="precise">Precise (polygon)</option>
+            </select>
+          </label>
         </Section>
         {errors.length>0&&<div style={{marginTop:12,padding:10,border:`1px solid ${C.bad}55`,borderRadius:6,background:`${C.bad}12`}}>
           {errors.map((e,i)=><div key={i} style={{color:C.bad,fontSize:12,padding:"2px 0"}}>• {e}</div>)}
@@ -1243,16 +1376,19 @@ function App(){
 
       {/* centre: viewport */}
       <main style={{position:"relative",minWidth:0,background:C.bg}}>
-        <Viewport cfg={cfg} result={result} tParam={tParam} mode={mode}
+        <Viewport cfg={cfg} result={result} tParam={tParam} mode={mode} openingShape={openingShape}
           showLabels={showLabels} wireframe={wireframe} sectionCut={sectionCut} onResetRef={resetCamRef}/>
         {/* status lamp */}
         <div style={{position:"absolute",top:12,left:12,right:12,display:"flex",gap:10,alignItems:"center",
           background:`${C.panel}e6`,border:`1px solid ${C.line}`,borderLeft:`4px solid ${statusInfo.tone}`,
           borderRadius:6,padding:"9px 14px",backdropFilter:"blur(4px)"}}>
           <span style={{width:11,height:11,borderRadius:99,background:statusInfo.tone,boxShadow:`0 0 12px ${statusInfo.tone}`}}/>
-          <div>
+          <div style={{flex:1}}>
             <div style={{fontWeight:800,letterSpacing:"0.08em",fontSize:12.5}}>{statusInfo.head}</div>
             <div style={{color:C.dim,fontSize:11.5}}>{statusInfo.sub}</div>
+          </div>
+          <div style={{fontSize:10,color:C.faint,...S.mono,border:`1px solid ${C.line}`,padding:"4px 8px",borderRadius:4}}>
+            {openingShape==="circle"?"●":"▭"} {settings.collisionMethod==="precise"?"Precise":"Fast"}
           </div>
         </div>
         {/* view toggles + sidebar toggles */}
